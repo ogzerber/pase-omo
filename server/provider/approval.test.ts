@@ -13,7 +13,7 @@ import {
   registerApprovalHandlers,
   submitApprovalResponse,
 } from "./approval.js";
-import { OmoSession } from "./omo-session.js";
+import { OmoSession, questionForm } from "./omo-session.js";
 
 interface MockProcessInstance {
   emit(event: Record<string, unknown>): void;
@@ -52,7 +52,11 @@ vi.mock("./omo-process.js", () => {
 
 const sessions: OmoSession[] = [];
 
-function createSession(sessionId = "provider-session-1") {
+function createSession(sessionId = "provider-session-1"): {
+  process: MockProcessInstance;
+  session: OmoSession;
+  emit: ReturnType<typeof vi.fn>;
+} {
   const emit = vi.fn();
   const session = new OmoSession({
     paseoSessionId: sessionId,
@@ -243,7 +247,7 @@ describe("approval RPC handlers", () => {
     expect(payload.requests[0]?.questions).toEqual(questions);
     expect(payload.requests[0]?.options).toHaveLength(12);
     const permission = emit.mock.calls.find(([event]) => event.type === "session.permission")?.[0];
-    expect(permission.request.input).toEqual({ questions });
+    expect(permission.request.input).toEqual(questionForm(questions).input);
     const response = ApprovalResponseSchema.parse({ behavior: "allow", answers, comment: "  전체 의견\n" });
     await expect(submitApprovalResponse({ agentId: "agent-1", requestId: "multi", response }, context("agent-1"))).resolves.toEqual({ submitted: true });
     expect(process.notify).toHaveBeenCalledExactlyOnceWith({ type: "extension_ui_response", id: "multi", answers, comment: "  전체 의견\n" });
@@ -274,11 +278,9 @@ describe("approval RPC handlers", () => {
     { answers: { features: { selected: ["unknown"] } } },
     { answers: { features: { selected: ["feature-0", "feature-0"] } } },
     { answers: { region: { selected: ["서울", "부산"] } } },
-    { answers: {} },
     { answers: { notes: { selected: [], text: " " } } },
     { answers: { notes: { selected: "bad type" } } },
     { answers: { notes: { selected: [], text: "valid", extra: true } } },
-    { answers: {}, comment: 42 },
   ])("keeps invalid structured replies pending on both response surfaces %#", (updatedInput) => {
     const { process, session, emit } = createSession();
     process.emit({ type: "extension_ui_request", id: "multi", method: "question", questions });
@@ -337,6 +339,163 @@ describe("approval RPC handlers", () => {
     session.respondToPermission("multi", { behavior: "deny" });
     expect(process.notify).toHaveBeenCalledExactlyOnceWith({ type: "extension_ui_response", id: "multi", cancelled: true });
     expect(session.getPendingUiRequests()).toEqual([]);
+  });
+
+  it("gives Paseo's question card every question and maps its answers back by id", () => {
+    // Paseo draws a kind:"question" permission from request.input alone; without
+    // it the card rendered empty with no way to answer.
+    const { process, session, emit } = createSession();
+    process.emit({
+      type: "extension_ui_request",
+      id: "question-1",
+      method: "question",
+      questions: [
+        {
+          id: "region",
+          header: "Region",
+          question: "Which region?",
+          options: [{ label: "Seoul", description: "ap-northeast-2" }, { label: "Tokyo" }],
+          multiSelect: false,
+        },
+        {
+          id: "checks",
+          header: "Checks",
+          question: "Which checks?",
+          options: [{ label: "Lint" }, { label: "Unit, fast" }, { label: "E2E" }],
+          multiSelect: true,
+        },
+        { id: "notes", header: "Region", question: "Anything else?", options: [], multiSelect: false },
+      ],
+    });
+
+    const permission = emit.mock.calls
+      .map(([event]) => event)
+      .find((event) => event.type === "session.permission");
+    expect(permission.request.kind).toBe("question");
+    expect(permission.request.input).toEqual({
+      questions: [
+        {
+          question: "Which region?",
+          header: "Region",
+          options: [{ label: "Seoul", description: "ap-northeast-2" }, { label: "Tokyo" }],
+          multiSelect: false,
+          allowOther: true,
+        },
+        {
+          question: "Which checks?",
+          header: "Checks",
+          options: [{ label: "Lint" }, { label: "Unit, fast" }, { label: "E2E" }],
+          multiSelect: true,
+          allowOther: true,
+        },
+        { question: "Anything else?", header: "Region (2)", options: [], multiSelect: false, allowOther: true },
+      ],
+    });
+
+    // The card's submission: the request input plus one string per header.
+    session.respondToPermission("question-1", {
+      behavior: "allow",
+      updatedInput: {
+        ...permission.request.input,
+        answers: { Region: "Seoul", Checks: "Lint, Unit, fast, also smoke", "Region (2)": "ship it" },
+      },
+    });
+
+    expect(process.notify).toHaveBeenCalledTimes(1);
+    expect(process.notify).toHaveBeenCalledWith({
+      type: "extension_ui_response",
+      id: "question-1",
+      answers: {
+        region: { selected: ["Seoul"] },
+        checks: { selected: ["Lint", "Unit, fast"], text: "also smoke" },
+        notes: { selected: [], text: "ship it" },
+      },
+    });
+  });
+
+  it("gives Paseo's question card every select option and returns the chosen label as the value", () => {
+    const { process, session, emit } = createSession();
+    const options = ["A", "B", "C", "D", "E", "F", "G", "H", "Production"];
+    process.emit({ type: "extension_ui_request", id: "select-1", method: "select", title: "Choose environment", options });
+
+    const permission = emit.mock.calls
+      .map(([event]) => event)
+      .find((event) => event.type === "session.permission");
+    expect(permission.request.kind).toBe("question");
+    expect(permission.request.input).toEqual({
+      questions: [
+        {
+          question: "Choose environment",
+          header: "선택",
+          options: options.map((label) => ({ label })),
+          multiSelect: false,
+          allowOther: false,
+        },
+      ],
+    });
+
+    session.respondToPermission("select-1", {
+      behavior: "allow",
+      updatedInput: { ...permission.request.input, answers: { "선택": "Production" } },
+    });
+    expect(process.notify).toHaveBeenCalledWith({ type: "extension_ui_response", id: "select-1", value: "Production" });
+  });
+
+  it("cancels a select the card answers with a value OmO never offered", () => {
+    const { process, session } = createSession();
+    process.emit({ type: "extension_ui_request", id: "select-1", method: "select", title: "Pick", options: ["A", "B"] });
+
+    session.respondToPermission("select-1", { behavior: "allow", updatedInput: { answers: { "선택": "Z" } } });
+
+    expect(process.notify).toHaveBeenCalledWith({ type: "extension_ui_response", id: "select-1", cancelled: true });
+  });
+
+  it("cancels a question the card submits with no answers instead of leaving OmO waiting", () => {
+    const { process, session } = createSession();
+    process.emit({
+      type: "extension_ui_request",
+      id: "question-1",
+      method: "question",
+      questions: [{ id: "region", header: "Region", question: "Which region?", options: [], multiSelect: false }],
+    });
+
+    session.respondToPermission("question-1", { behavior: "allow", updatedInput: { answers: {} } });
+
+    expect(process.notify).toHaveBeenCalledWith({ type: "extension_ui_response", id: "question-1", cancelled: true });
+  });
+
+  it("preserves a question id that is also an Object prototype key", () => {
+    // Given an OmO question with an unrestricted string id.
+    const { process, session } = createSession();
+    process.emit({
+      type: "extension_ui_request", id: "prototype-question", method: "question",
+      questions: [{ id: "__proto__", header: "Choice", question: "Pick", options: [{ label: "A" }], multiSelect: false }],
+    });
+
+    // When the native card submits its answer.
+    session.respondToPermission("prototype-question", {
+      behavior: "allow", updatedInput: { answers: { Choice: "A" } },
+    });
+
+    // Then the answer remains an own JSON key rather than changing the map prototype.
+    expect(process.notify).toHaveBeenCalledWith({
+      type: "extension_ui_response", id: "prototype-question",
+      answers: { ["__proto__"]: { selected: ["A"] } },
+    });
+  });
+
+  it.each([undefined, {}, { answers: [] }])("cancels a select without a valid card answer (%j)", (updatedInput) => {
+    // Given a pending native selection with no legacy action chosen.
+    const { process, session } = createSession();
+    process.emit({ type: "extension_ui_request", id: "select-empty", method: "select", options: ["A"] });
+
+    // When an empty or malformed submission crosses the permission boundary.
+    session.respondToPermission("select-empty", {
+      behavior: "allow", ...(updatedInput ? { updatedInput } : {}),
+    });
+
+    // Then OmO receives cancellation, never a value it did not offer.
+    expect(process.notify).toHaveBeenCalledWith({ type: "extension_ui_response", id: "select-empty", cancelled: true });
   });
 
   it("registers both approval RPC handlers for entry wiring", () => {

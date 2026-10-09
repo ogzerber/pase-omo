@@ -126,6 +126,57 @@ export function allThinkingOptions(models: readonly ProviderModel[]): ProviderTh
 }
 
 /**
+ * Ask OmO for its models until the list holds still.
+ *
+ * Extensions such as the CPA plugin register their providers asynchronously,
+ * a few hundred milliseconds after the RPC channel answers. The first
+ * `get_available_models` reply can therefore carry only the static models.json
+ * entries (measured: 3 models, then 103 a quarter second later), and caching
+ * that first answer is what left new agents with an almost empty model picker.
+ *
+ * The answer is trusted only after it has stopped changing for
+ * `stablePolls` consecutive replies, and the result is the union of every
+ * reply seen. Both halves matter: a registration that lands after an
+ * earlier answer of the same size is still caught because only the change
+ * matters, not the size, and a reply that momentarily drops a provider cannot
+ * shrink the answer or end the wait early. A late registration that never
+ * lands inside the window is still bounded by `maxAttempts` so a probe cannot
+ * hang forever.
+ */
+export async function settledModels(
+  fetchModels: () => Promise<OmoModelRecord[]>,
+  options: { intervalMs?: number; stablePolls?: number; maxAttempts?: number } = {},
+): Promise<OmoModelRecord[]> {
+  const intervalMs = options.intervalMs ?? 250;
+  const stablePolls = options.stablePolls ?? 3;
+  const maxAttempts = options.maxAttempts ?? 24;
+  const seen = new Map<string, OmoModelRecord>();
+  let signature = "";
+  let unchanged = 0;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const next = await fetchModels();
+    let grew = false;
+    for (const record of next) {
+      const key = encodeModelId(record);
+      if (!seen.has(key)) {
+        seen.set(key, record);
+        grew = true;
+      }
+    }
+    const nextSignature = [...seen.keys()].sort().join("\n");
+    if (grew || nextSignature !== signature) {
+      signature = nextSignature;
+      unchanged = 0;
+    } else {
+      unchanged += 1;
+    }
+    if (unchanged >= stablePolls) break;
+    if (attempt < maxAttempts - 1) await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return [...seen.values()];
+}
+
+/**
  * Env var carrying this client's RPC capabilities to the OmO child, comma
  * separated.
  */
@@ -152,6 +203,82 @@ export function withQuestionCapability(existing: string | undefined): string {
   return advertised.join(",");
 }
 
+/** One OmO question as Paseo's question card answers it: keyed by `header`. */
+export interface FormQuestion {
+  id: string;
+  header: string;
+  labels: string[];
+  multiSelect: boolean;
+}
+
+/**
+ * Paseo draws a `kind: "question"` permission with its own question card, built
+ * from `request.input.questions` in Claude's AskUserQuestion shape, and ignores
+ * `actions` for that kind. Without this input the card had nothing to show and
+ * no way to answer. The card keys answers by header, so headers are made unique.
+ */
+export function questionForm(questions: readonly Json[], allowOther = true) {
+  const seen = new Set<string>();
+  const form: FormQuestion[] = [];
+  const cards = questions.map((q, index) => {
+    const base = typeof q.header === "string" && q.header.trim() ? q.header.trim() : `Question ${index + 1}`;
+    let header = base;
+    for (let n = 2; seen.has(header); n++) header = `${base} (${n})`;
+    seen.add(header);
+    const options = (Array.isArray(q.options) ? q.options : []).flatMap((option) => {
+      if (typeof option !== "object" || option === null) return [];
+      const { label, description } = option as Json;
+      if (typeof label !== "string") return [];
+      return [typeof description === "string" ? { label, description } : { label }];
+    });
+    const multiSelect = q.multiSelect === true;
+    form.push({
+      id: typeof q.id === "string" ? q.id : "answer",
+      header,
+      labels: options.map((option) => option.label),
+      multiSelect,
+    });
+    return { question: String(q.question ?? header), header, options, multiSelect, allowOther };
+  });
+  return { input: { questions: cards }, form };
+}
+
+/**
+ * One answer from Paseo's question card in OmO's shape. The card sends a single
+ * string per question: the chosen label or the typed text, or for multi-select
+ * the chosen labels followed by any typed text, joined by ", ".
+ */
+export function parseFormAnswer(value: string, question: FormQuestion): { selected: string[]; text?: string } {
+  if (question.labels.includes(value)) return { selected: [value] };
+  if (!question.multiSelect) return { selected: [], text: value };
+  const parts = value.split(", ");
+  const selected: string[] = [];
+  let start = 0;
+  scan: while (start < parts.length) {
+    // Longest match first, so a label that itself contains ", " stays whole.
+    for (let end = parts.length; end > start; end--) {
+      const label = parts.slice(start, end).join(", ");
+      if (question.labels.includes(label)) {
+        selected.push(label);
+        start = end;
+        continue scan;
+      }
+    }
+    break;
+  }
+  const text = parts.slice(start).join(", ");
+  return text ? { selected, text } : { selected };
+}
+
+/** The card's answers when they are Paseo's header-keyed strings, else undefined. */
+function cardAnswerStrings(value: unknown): Record<string, string> | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value);
+  return entries.every(([, answer]) => typeof answer === "string")
+    ? Object.fromEntries(entries) as Record<string, string>
+    : undefined;
+}
+
 interface PendingUi {
   method: "confirm" | "select" | "question";
   title: string;
@@ -160,6 +287,8 @@ interface PendingUi {
   /** Legacy single-question key used by `extension_ui_response.answers`. */
   questionKey?: string;
   questions?: PendingApprovalRequest["questions"];
+  /** Every question of a question request, as Paseo's question card answers them. */
+  form?: FormQuestion[];
 }
 
 export interface OmoSessionOptions {
@@ -201,6 +330,8 @@ export class OmoSession {
   private lastTodoSignature: string | undefined;
   /** Latest list seen this turn, drawn once when the turn ends. */
   private pendingTodoItems: TodoPublishItem[] | undefined;
+  /** Finished-turn list waiting for the turn-ended hook to draw it. */
+  private todoCardReady: TodoPublishItem[] | undefined;
   private readonly unregisterSession: () => void;
   private closed = false;
   /** True between `suspend()` and `resume()`, when no child process exists. */
@@ -268,13 +399,38 @@ export class OmoSession {
   }
 
   /**
-   * Timeline id of this session's live todo card.
+   * Timeline id of this session's todo card.
    *
-   * Stable for the session so repeated `todo` calls rewrite one card instead of
-   * appending another copy of the same list.
+   * Stable for the session so each turn's card replaces the last one: the
+   * daemon replaces a plugin row re-appended under the same id, which a
+   * provider `todo` item never does.
    */
   private get todoItemId(): string {
     return `todo-${this.sessionId}`;
+  }
+
+  /**
+   * The card the turn that just ended wants drawn, retained until acknowledged.
+   *
+   * Drawn from the `agent.turn_ended` hook through `timeline.append`, because
+   * only that path replaces an earlier row; a provider `todo` item is appended
+   * as another card every time and left one per turn in the chat.
+   */
+  takeTodoCard(): { id: string; items: TodoPublishItem[] } | undefined {
+    const items = this.todoCardReady;
+    return items === undefined ? undefined : { id: this.todoItemId, items };
+  }
+
+  /** Called only after timeline.append succeeds; a failed append stays retryable. */
+  async acknowledgeTodoCard(items: TodoPublishItem[]): Promise<void> {
+    const signature = holdTodo(items).signature;
+    this.lastTodoSignature = signature;
+    // An append in flight must not clear a newer finished turn's card.
+    if (this.todoCardReady === items) this.todoCardReady = undefined;
+    await rememberPublishedTodo(this.todoMemoryKey, signature).catch((error: unknown) => {
+      // Losing the note costs one duplicate card after a reload, not the card.
+      this.options.log(`todo card memory write failed: ${describe(error)}`);
+    });
   }
 
   getPendingUiRequests(): PendingApprovalRequest[] {
@@ -414,8 +570,11 @@ export class OmoSession {
 
   private async refreshCatalog(): Promise<void> {
     try {
-      const models = await this.proc.call<{ models: OmoModelRecord[] }>("get_available_models", {}, 60_000);
-      this.models = toProviderModels(models.models ?? []);
+      const models = await settledModels(
+        async () =>
+          (await this.proc.call<{ models: OmoModelRecord[] }>("get_available_models", {}, 60_000)).models ?? [],
+      );
+      this.models = toProviderModels(models);
     } catch (error) {
       this.options.log(`get_available_models failed: ${describe(error)}`);
     }
@@ -746,6 +905,46 @@ export class OmoSession {
     if (!pending) return;
     if (response.behavior === "deny") {
       this.respondToUiRequest(permissionId, { behavior: "deny" });
+      return;
+    }
+    const answers = response.updatedInput?.answers;
+    const cardAnswers = cardAnswerStrings(answers);
+    if (pending.form && cardAnswers) {
+      // Paseo's native question card: one string per question, keyed by header.
+      if (pending.method === "select") {
+        // A selection has exactly one card question and must resolve to one of its
+        // labels; anything else would hand OmO a value it never offered.
+        const [choice] = pending.form;
+        const value = choice ? cardAnswers[choice.header] : undefined;
+        this.proc.notify(
+          typeof value === "string" && choice?.labels.includes(value)
+            ? { type: "extension_ui_response", id: permissionId, value }
+            : { type: "extension_ui_response", id: permissionId, cancelled: true },
+        );
+      } else {
+        const parsed = Object.fromEntries(pending.form.flatMap((question) => {
+          const value = cardAnswers[question.header];
+          return typeof value === "string" && value.trim()
+            ? [[question.id, parseFormAnswer(value, question)]]
+            : [];
+        }));
+        // OmO keeps a question open on an empty answer set, and Paseo has already
+        // dropped the card, so an empty submission is a cancel.
+        this.proc.notify(
+          Object.keys(parsed).length > 0
+            ? { type: "extension_ui_response", id: permissionId, answers: parsed }
+            : { type: "extension_ui_response", id: permissionId, cancelled: true },
+        );
+      }
+      this.pendingUi.delete(permissionId);
+      this.emit({ type: "session.permission_resolved", sessionId: this.sessionId, permissionId });
+    } else if (
+      pending.method === "select" &&
+      response.selectedActionId === undefined &&
+      (typeof answers !== "object" || answers === null || Array.isArray(answers))
+    ) {
+      // No action and no usable answer: cancel rather than hand OmO a value it never offered.
+      this.respondToUiRequest(permissionId, { behavior: "deny" });
     } else if (response.updatedInput !== undefined) {
       this.respondToUiRequest(permissionId, ApprovalResponseSchema.parse({ ...response.updatedInput, behavior: "allow" }));
     } else if (pending.method === "confirm") {
@@ -897,13 +1096,7 @@ export class OmoSession {
     const finalTodo = finalTodoPublication(this.lastTodoSignature, this.pendingTodoItems);
     this.pendingTodoItems = undefined;
     if (finalTodo.publish && finalTodo.items !== undefined && finalTodo.signature !== undefined) {
-      const signature = finalTodo.signature;
-      this.lastTodoSignature = signature;
-      this.item({ type: "todo", id: this.todoItemId, items: finalTodo.items });
-      void rememberPublishedTodo(this.todoMemoryKey, signature).catch((error: unknown) => {
-        // Losing the note costs one duplicate card after a reload, not the card.
-        this.options.log(`todo card memory write failed: ${describe(error)}`);
-      });
+      this.todoCardReady = finalTodo.items;
     }
 
     const turnId = this.activeTurnId;
@@ -1154,7 +1347,13 @@ export class OmoSession {
         return { id: actionId, label, behavior: "allow" as const };
       });
       const title = String(event.title ?? "OmO needs a choice");
-      this.pendingUi.set(id, { method: "select", title, optionByAction });
+      // Same native question card as `question`, as one single-select question
+      // with every option and no free text: OmO only accepts a listed value.
+      const { input, form } = questionForm(
+        [{ header: "선택", question: title, options: options.map((label) => ({ label })), multiSelect: false }],
+        false,
+      );
+      this.pendingUi.set(id, { method: "select", title, optionByAction, form });
       this.emit({
         type: "session.permission",
         sessionId: this.sessionId,
@@ -1163,6 +1362,7 @@ export class OmoSession {
           name: "select",
           kind: "question",
           title,
+          input,
           actions: [...actions, { id: "deny", label: "Cancel", behavior: "deny" as const }],
         },
       });
@@ -1188,12 +1388,14 @@ export class OmoSession {
         return { id: actionId, label, behavior: "allow" as const };
       });
       const title = first.question || first.header || "OmO 질문";
+      const { input, form } = questionForm(questions);
       this.pendingUi.set(id, {
         method: "question",
         title,
         optionByAction,
         questionKey: first.id,
         questions,
+        form,
       });
       this.emit({
         type: "session.permission",
@@ -1204,7 +1406,7 @@ export class OmoSession {
           kind: "question",
           title: first.header || "OmO 질문",
           description: first.question,
-          input: { questions },
+          input,
           actions: [
             ...(questions.length === 1 && !first.multiSelect ? actions : []),
             { id: "deny", label: "건너뛰기", behavior: "deny" as const },

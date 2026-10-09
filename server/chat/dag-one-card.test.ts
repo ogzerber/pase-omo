@@ -103,10 +103,13 @@ test("a run that works its way through its nodes leaves exactly one card", async
 
   // The run moves: each of these used to be another card in the conversation.
   await saveRun("dag_1", "running", 1);
+  await vi.advanceTimersByTimeAsync(2000);
   await publisher.settle();
   await saveRun("dag_1", "running", 2);
+  await vi.advanceTimersByTimeAsync(2000);
   await publisher.settle();
   await saveRun("dag_1", "completed", 3);
+  await vi.advanceTimersByTimeAsync(2000);
   await publisher.settle();
 
   expect(appends.map((item) => item.id)).toEqual(["dag-dag_1"]);
@@ -123,6 +126,7 @@ test("nothing is drawn while the run is still working, because the pill is the l
 
   await saveRun("dag_1", "running", 1);
   await publisher.onTurnStarted(agent, context);
+  await vi.advanceTimersByTimeAsync(5000);
   await publisher.settle();
 
   expect(appends).toEqual([]);
@@ -158,6 +162,7 @@ test("a second run gets its own single card, and the finished one is not redrawn
   expect(appends.map((item) => item.id)).toEqual(["dag-dag_1"]);
 
   await saveRun("dag_2", "completed", 3);
+  await vi.advanceTimersByTimeAsync(2000);
   await publisher.settle();
 
   expect(appends.map((item) => item.id)).toEqual(["dag-dag_1", "dag-dag_2"]);
