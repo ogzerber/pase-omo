@@ -7,6 +7,7 @@ import type {
   ProviderSetting,
   ProviderThinkingOption,
   ProviderTimelineItem,
+  ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
 import {
   ApprovalQuestionSchema,
@@ -316,8 +317,9 @@ export class OmoSession {
   private config: ProviderSessionConfig;
   private models: ProviderModel[] = [];
   private state: OmoStateRecord = {};
-  private sessionReplaced = false;
+  private usage: ProviderUsage = {};
   private commands: OmoCommandRecord[] = [];
+  private sessionReplaced = false;
 
   private turnSeq = 0;
   private messageSeq = 0;
@@ -513,6 +515,7 @@ export class OmoSession {
     this.emit({ type: "session.config", sessionId: this.sessionId, config: this.configState() });
     this.publishCommands();
     if (history === "replay") await this.replay();
+    await this.publishContextUsage();
     this.emit({ type: "session.ready", requestId, sessionId: this.sessionId });
     this.scheduleTaskScan(TASK_POLL_ACTIVE_MS);
   }
@@ -1049,6 +1052,10 @@ export class OmoSession {
         return;
       case "message_end":
         this.handleMessageEnd(event.message);
+        if (roleOf(event.message) === "assistant") void this.publishContextUsage(this.activeTurnId ?? undefined);
+        return;
+      case "auto_compaction_end":
+        void this.publishContextUsage(this.activeTurnId ?? undefined);
         return;
       case "tool_execution_start":
       case "tool_execution_update":
@@ -1108,7 +1115,11 @@ export class OmoSession {
     }
     this.emit({ type: "session.turn", sessionId: this.sessionId, turnId, state: event?.aborted === true ? "canceled" : "completed" });
     const usage = usageOf(event);
-    if (usage) this.emit({ type: "session.usage", sessionId: this.sessionId, turnId, usage });
+    if (usage) {
+      this.usage = { ...this.usage, ...usage };
+      this.emit({ type: "session.usage", sessionId: this.sessionId, turnId, usage: this.usage });
+    }
+    void this.publishContextUsage(turnId);
     const persistence = this.persistence();
     if (persistence) this.emit({ type: "session.persistence", sessionId: this.sessionId, persistence });
   }
@@ -1131,6 +1142,30 @@ export class OmoSession {
     if (typeof event.thinkingLevel === "string") this.state = { ...this.state, thinkingLevel: event.thinkingLevel };
     if (typeof event.fastMode === "boolean") this.state = { ...this.state, fastMode: event.fastMode };
     this.emit({ type: "session.config", sessionId: this.sessionId, config: this.configState() });
+    if (event.type === "model_changed") void this.publishContextUsage(this.activeTurnId ?? undefined);
+  }
+
+  private async publishContextUsage(turnId?: string): Promise<void> {
+    try {
+      const { contextUsage } = await this.proc.call<{
+        contextUsage?: { tokens: number | null; contextWindow: number };
+      }>("get_session_stats");
+      if (this.closed || !contextUsage) return;
+      this.usage = {
+        ...this.usage,
+        contextWindowMaxTokens: contextUsage.contextWindow,
+      };
+      if (contextUsage.tokens === null) delete this.usage.contextWindowUsedTokens;
+      else this.usage.contextWindowUsedTokens = contextUsage.tokens;
+      this.emit({
+        type: "session.usage",
+        sessionId: this.sessionId,
+        ...(turnId ? { turnId } : {}),
+        usage: this.usage,
+      });
+    } catch (error) {
+      if (!this.closed) this.options.log(`get_session_stats failed: ${describe(error)}`);
+    }
   }
 
   private streamItemId(kind: "assistant" | "reasoning", contentIndex: number): string {
