@@ -7,7 +7,8 @@ import { taskStateDir } from "../task-state.js";
 /**
  * `task()` runs, surfaced as the child sessions Paseo already knows how to draw.
  *
- * OmO records every spawned task under `<cwd>/.omo/senpi-task/tasks/st_*.json`
+ * OmO records every spawned task under `<task state dir>/tasks/st_*.json`
+ * (see `taskStateDir`: the workspace's `.omo/senpi-task`, or OmO 5.1's per-project directory)
  * with the parent session it belongs to, but nothing read those files, so a
  * subagent run left only a flat tool-call row: no status, no link, and nothing
  * at all once the row scrolled away. A provider may announce a child session by
