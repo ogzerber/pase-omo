@@ -699,7 +699,7 @@ export class OmoSession {
 
   // ---------------------------------------------------------------- prompting
 
-  prompt(clientMessageId: string, text: string, images: Array<{ data: string; mimeType: string }>, steer: boolean): void {
+  prompt(clientMessageId: string, text: string, images: Array<{ type: "image"; data: string; mimeType: string }>, steer: boolean): void {
     if (steer) {
       if (!this.activeTurnId) {
         this.emit({

@@ -308,12 +308,12 @@ function createOmoConnection(capabilities: readonly string[]): ProviderConnectio
           return;
         }
         const texts: string[] = [];
-        const images: Array<{ data: string; mimeType: string }> = [];
+        const images: Array<{ type: "image"; data: string; mimeType: string }> = [];
         for (const part of input.prompt.input.content) {
           if (part.type === "text") {
             texts.push(part.text);
           } else if (part.type === "image") {
-            images.push({ data: part.data, mimeType: part.mimeType });
+            images.push({ type: "image", data: part.data, mimeType: part.mimeType });
           } else if (part.type === "uploaded_file") {
             texts.push(`Attached file: ${part.path}`);
           } else if ("text" in part && typeof part.text === "string") {
