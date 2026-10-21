@@ -45,6 +45,8 @@ const PROCESS_EXIT_GRACE_MS = 5_000;
  */
 const TASK_POLL_ACTIVE_MS = 2_000;
 const TASK_POLL_IDLE_MS = 15_000;
+/** Wait for the daemon to subscribe before repeating the context usage published at open. */
+const USAGE_REPUBLISH_MS = 1_500;
 
 function withTimeout(promise: Promise<void>, ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -341,6 +343,7 @@ export class OmoSession {
   /** What has already been published for each `task()` run, keyed by task id. */
   private readonly taskStates = new Map<string, TaskState>();
   private taskTimer: ReturnType<typeof setTimeout> | null = null;
+  private usageRepublishTimer: ReturnType<typeof setTimeout> | null = null;
   private taskScanning = false;
   private liveTaskOwner = Symbol("omo-task-process");
 
@@ -517,6 +520,13 @@ export class OmoSession {
     if (history === "replay") await this.replay();
     await this.publishContextUsage();
     this.emit({ type: "session.ready", requestId, sessionId: this.sessionId });
+    // Paseo 0.12 replays only timeline rows from events emitted before it
+    // subscribes, so the usage above never reaches a reopened session. Send it
+    // again once the daemon is listening.
+    this.usageRepublishTimer = setTimeout(() => {
+      this.usageRepublishTimer = null;
+      if (!this.closed && !this.suspended) void this.publishContextUsage(this.activeTurnId ?? undefined);
+    }, USAGE_REPUBLISH_MS);
     this.scheduleTaskScan(TASK_POLL_ACTIVE_MS);
   }
 
@@ -966,6 +976,10 @@ export class OmoSession {
     if (this.taskTimer !== null) {
       clearTimeout(this.taskTimer);
       this.taskTimer = null;
+    }
+    if (this.usageRepublishTimer !== null) {
+      clearTimeout(this.usageRepublishTimer);
+      this.usageRepublishTimer = null;
     }
     this.unregisterSession();
     for (const timer of this.flushTimers.values()) clearTimeout(timer);
